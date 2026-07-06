@@ -1131,7 +1131,6 @@ NTMAP is a distributed, cloud-native observability platform designed to ingest m
 
 * **Geo-Federation:** Instead of massive data duplication, we use **Elasticsearch Cross Cluster Search (CCS)** to query across regional pods.
 * **Intelligent Capture:** We achieve regulatory-grade packet capture using **Live Session Filtering**, ensuring expensive raw PCAP storage is only consumed for high-value anomalies.
-* **Exactly-Once Stream Processing:** Using Flink with RocksDB state backends, we perform stateful session stitching keyed by **IMSI-hashes**, ensuring control-plane and user-plane events for a single subscriber are processed contiguously.
 
 ---
 
@@ -1152,11 +1151,9 @@ NTMAP is a distributed, cloud-native observability platform designed to ingest m
 * **Search:** Elasticsearch (distributed clusters) for signaling logs.
 * **Cold:** S3-compatible object store for long-term PCAP archive.
 
+### Tier 3: National Backend Environment (NBE) - The Analytics Intelligence
 
-
-### Tier 3: Northbound Environment (NBE) - The Analytics Intelligence
-
-* **ES Cross Cluster Search:** The "Smart Indexer" allows our Northbound APIs to aggregate data from local and GR-site Elasticsearch clusters without the overhead of bulk data replication.
+* **ES Cross Cluster Search:** The "Smart Indexer" allows the APIs to aggregate data from local and GR-site Elasticsearch clusters without the overhead of bulk data replication.
 * **Dynamic Config:** The brain of the platform. It translates user-requested troubleshooting sessions into filter rules, which are propagated down to the FE/RBE in real-time via the Message Bus.
 
 ---
@@ -1178,18 +1175,10 @@ We do not store all data on expensive NVMe. Our ClickHouse and Elasticsearch clu
 * **Cold (30-365 days):** S3-backed MergeTree tables.
 This allows us to maintain 13 months of data with a storage cost structure that is 80% lower than a monolithic approach.
 
-### 3.3 Production-Grade Observability
-
-Beyond basic metrics, we implement **SLO-based alerting** using the *Sloth* generator.
-
-* **Critical Path:** If the `Packet capture completeness` drops below 99.999%, the CI/CD pipeline *automatically freezes* all new feature deployments.
-* **Distributed Tracing:** We use OpenTelemetry to trace a query from the `NBE API` through the `Cross Cluster Search` coordinating node, down into the `RBE ClickHouse shard`, identifying bottlenecks in the query plan before they hit the user.
-
-### 3.4 Resilient Deployment (GitOps)
+### 3.3 Resilient Deployment (GitOps)
 
 We utilize **ArgoCD with an App-of-Apps pattern**. Each pod (FE, RBE, NBE) is managed as a standalone helm release.
 
-* **Schema Evolution:** For databases like ClickHouse and PostgreSQL, we use `expand-contract` migration patterns (e.g., adding columns without breaking existing queries), ensuring zero-downtime releases.
 * **Canary Analysis:** Argo Rollouts performs automated canary analysis based on Prometheus metrics. If the "error-budget" for a canary version burns too fast, the traffic is automatically shifted back to the stable version without manual intervention.
 
 ---
@@ -1200,7 +1189,6 @@ Our DR strategy is **Active-Active** by design:
 
 * **Capture Layer:** Since raw packets are ephemeral, regional probes capture locally and persist to regional storage.
 * **Event Layer:** Metadata topics are replicated via Kafka MirrorMaker to the GR site, meaning that even if the primary site disappears, the historical event metadata is queryable from the GR site via the federated Elasticsearch cluster.
-* **Database HA:** Patroni (for PostgreSQL) and ClickHouse Keeper ensure that mastership is maintained across DC boundaries. In a site-wide failover, BGP anycast updates route traffic to the survivor, and the federated ES coordinating node automatically begins querying only the surviving GR cluster.
 
 ---
 
