@@ -384,7 +384,7 @@ Alert end-to-end latency............. < 2 seconds (p95)
 * **Kafka Backbone:** Partitioning is the key to our scalability. By keying topics with `murmur2(IMSI-hash)`, we guarantee that every event for a subscriber lands on the same partition.
 * **MirrorMaker 2:** This facilitates the asynchronous cross-DC replication essential for our active-active HA model.
 * **Storage Tiers:**
-* **Hot/Warm:** ClickHouse (OLAP) for CDR-like analytics and KPI rollups.
+* **Hot/Warm:** ElasticSearch Data Teiring
 * **Search:** Elasticsearch (distributed clusters) for signaling logs.
 * **Cold:** S3-compatible object store for long-term PCAP archive.
 
@@ -405,7 +405,7 @@ We utilize Flink with **checkpointing to S3** every 30 seconds. By employing a `
 
 ### 4.2 Tiered Storage & Cost Optimization
 
-We do not store all data on expensive NVMe. Our ClickHouse and Elasticsearch clusters utilize **TTL-based data movement**.
+We do not store all data on expensive NVMe. Our Elasticsearch clusters utilize **TTL-based data movement**.
 
 * **Hot (0-7 days):** Local NVMe for instantaneous troubleshooting.
 * **Warm (7-30 days):** SATA SSDs for trend analysis.
@@ -456,11 +456,11 @@ This tier is **bare-metal** or **virtualized** with SRIOV & DPDK to support high
    Hugepages: 1GB pages, mbuf pools per NUMA node
 ```
 
-## 4. Environments: Dev / Test / Staging / Production
+## 7. Environments: Dev / Test / Staging / Production
 
 We run **four distinct environments**, each isolated by network, IAM, and cloud account/datacenter.
 
-### 4.1 Environment Matrix
+### 7.1 Environment Matrix
 
 ```
 ┌─────────────┬──────────────┬─────────────┬──────────────┬───────────────┐
@@ -471,18 +471,17 @@ We run **four distinct environments**, each isolated by network, IAM, and cloud 
 │             │ generators   │ PCAP corpus │ (shadow tap) │  mirror       │
 │ Scale       │ 1 probe (VM) │ 2 probes(VM)│ 4 probes(HW) │ 40+ probes(HW)│
 │ Kafka       │ 3 brokers    │ 3 brokers   │ 6 brokers    │ 24 brokers    │
-│ ClickHouse  │ 1 node       │ 2 nodes     │ 6 nodes      │ 48 nodes      │
 │ Data        │ Fully synthetic│ Anonymized │ Anonymized   │ Real (encrypted)│
 │ Refresh     │ On commit    │ Nightly     │ Per release  │ Controlled    │
 │ Uptime SLA  │ None         │ None        │ 99%          │ 99.999%       │
 └─────────────┴──────────────┴─────────────┴──────────────┴───────────────┘
 ```
 
-### 4.2 Why Staging Uses a "Shadow Tap"
+### 7.2 Why Staging Uses a "Shadow Tap"
 
 Staging receives a **5% statistically-sampled mirror** of live production traffic (IMSI-anonymized at the probe). This lets us validate new decoders and detection rules against *real* protocol behaviors and malformed packets that synthetic generators can't reproduce — without risking production.
 
-### 4.3 Traffic Generation for Dev/Test
+### 7.3 Traffic Generation for Dev/Test
 
 ```
 DEV:  TRex (Cisco) + custom scenario scripts generating:
@@ -497,16 +496,16 @@ TEST: Curated PCAP corpus (12 TB) of:
       - Regression cases (every past production bug → a PCAP)
 ```
 
-## 5 Production Deployment Strategy
+## 8. Production Deployment Strategy
 
 - **Applications (k8s tier):** Argo Rollouts **canary** — 5% → 25% → 50% → 100%, with automatic rollback if SLO error budget burns (Prometheus-based analysis).
 - **Probes (bare-metal):** **Rolling, NPB-coordinated.** Because probes are stateless-ish capture nodes behind the packet broker, we drain one probe at a time. The NPB redistributes its flow-hash buckets to peers.
 
 ---
 
-## 6. Streaming / Message Bus Tier (Apache Kafka)
+## 9. Streaming / Message Bus Tier (Apache Kafka)
 
-### 6.1 Kafka Topology
+### 9.1 Kafka Topology
 
 ```
 Production Kafka Cluster (24 brokers, 3 racks × 8)
@@ -536,29 +535,25 @@ Production Kafka Cluster (24 brokers, 3 racks × 8)
   Compression: zstd            Tiered storage → S3 for older segments
 ```
 
-### 6.2 Why partition by IMSI-hash?
+### 9.2 Why partition by IMSI-hash?
 
 Subscriber session correlation requires that the control-plane event (e.g., GTP-C `Create Session`) and user-plane stats (GTP-U byte counters) for the *same subscriber* be processed by the *same* Flink task. Keying by IMSI-hash guarantees co-location, enabling **exactly-once stateful joins** without cross-task shuffles.
 
 ---
 
-## 7. Monitoring, Observability & Alerting
+## 10. Monitoring, Observability & Alerting
 
-### 7.1 The Observability Stack ("monitoring the monitor")
+### 10.1 The Observability Stack ("monitoring the monitor")
 
 ```
 ┌───────────────────────────────────────────────────────────┐
 │  METRICS:  Prometheus (federated) + Thanos (long-term)   │
 │    • Probe drop counters, mbuf usage, NUMA balance        │
-│    • Kafka lag (Burrow), Flink checkpoint duration        │
-│    • ClickHouse merge backlog, query latency p99          │
+│    • Kafka lag (Burrow)      │
 │    • Node exporter, DCGM (GPU), NIC stats                 │
 │                                                          │
 │  LOGS:     Loki + Promtail (app logs)                    │
 │            Elasticsearch (signaling/audit logs)          │
-│                                                          │
-│  TRACES:   OpenTelemetry → Tempo / Jaeger                │
-│            (API request → Flink → ClickHouse query span) │
 │                                                          │
 │  DASHBOARDS: Grafana (200+ dashboards)                   │
 │                                                          │
@@ -569,7 +564,7 @@ Subscriber session correlation requires that the control-plane event (e.g., GTP-
 └───────────────────────────────────────────────────────────┘
 ```
 
-### 7.2 Key SLOs & Golden Signals
+### 10.2 Key SLOs & Golden Signals
 
 ```
 ┌─────────────────────────────┬──────────┬────────────────────┐
@@ -583,9 +578,9 @@ Subscriber session correlation requires that the control-plane event (e.g., GTP-
 └─────────────────────────────┴──────────┴────────────────────┘
 ```
 
-## 8. Auto-Scaling Strategy
+## 11. Auto-Scaling Strategy
 
-### 8.1 What scales how
+### 11.1 What scales how
 
 ```
 ┌─────────────────┬──────────────────────────────────────────┐
@@ -606,7 +601,7 @@ Subscriber session correlation requires that the control-plane event (e.g., GTP-
 └─────────────────┴──────────────────────────────────────────┘
 ```
 
-## 9. Security & Compliance
+## 12. Security & Compliance
 
 Telecom data is *extremely* sensitive (subscriber PII, lawful intercept, GDPR).
 
