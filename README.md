@@ -316,21 +316,14 @@ How we measure if this initiative succeeds:
 
 ---
 
-## Summary
-
-This plan proposes a **standardized, push/pull hybrid monitoring system** built on **open standards (OpenTelemetry + Prometheus)** with a **common API and SDKs** to ensure consistency across teams. It covers the golden signals, enforces naming and labeling conventions, provides centralized storage, dashboards, and actionable alerting — all rolled out incrementally with strong governance and developer-focused adoption support.
-
----
-
-Would you like me to **deep-dive into any section** — for example, the detailed API/OpenAPI specification, the SDK design, the alerting rules library, or a build-vs-buy cost analysis?
-
-
-
 DevOps Infrastructure:
 
-I would like you to describe a complex DevOps and architecture (example: A networking monitoring system that receives a mirror of the traffic among different network functions in 4G or 5G network of a telecom operator). Include as many details as you can: development, testing and production environments; operational parameters; database systems; their backup and replication processes, DR-HA configurations, monitoring and testing, infrastructure management and scaling; any other interesting features, etc.
+We are interested in your skill level and general experience with Devops infrastructure. We would like you to describe, to the extent of your knowledge, experience, contractual obligations (e.g., confidentiality agreements in place), and available time, the most complex Devops and architecture you have worked with.  
 
-Focus on providing as much details as possible, things should be super crystal-clear. Include diagrams and text explanations.
+Include as many details as you wish: development, testing and production environments; operational parameters; database systems, their backup and replication processes, DR-HA 
+configurations; monitoring and testing; infrastructure management and scaling; any other interesting features, etc. 
+
+Consider this exercise as the first part of a whiteboard interview question - as we wi l use it to move the discussion forward during the technical interview. As much detail as possible is appreciated (diagrams and text explanations). 
 
 
 
@@ -370,53 +363,14 @@ Alert end-to-end latency............. < 2 seconds (p95)
 ## 2. High-Level Architecture
 
 ```
-                          TELECOM CORE NETWORK (Production Traffic)
-   ┌────────────┐   ┌────────────┐   ┌────────────┐   ┌────────────┐
-   │  4G MME    │   │  4G SGW/PGW│   │  5G AMF/SMF │  │  5G UPF/IMS │
-   └─────┬──────┘   └─────┬──────┘   └─────┬──────┘   └─────┬──────┘
-         │  (SPAN/TAP optical taps + Network Packet Brokers) │
-         ▼                ▼                ▼                ▼
-   ╔═══════════════════════════════════════════════════════════════╗
-   ║          PACKET BROKER / AGGREGATION LAYER (NPB)              ║
-   ║   Gigamon / Arista 7130 — filtering, dedup, load-balance,     ║
-   ║   header-stripping, GTP-correlation-aware hashing             ║
-   ╚════════════════════════════════╤═════════════════════════════╝
-                                     │ (balanced 100/400GbE flows,
-                                     │  flow-consistent hashing)
-   ┌─────────────────────────────────┴────────────────────────────┐
-   │                  CAPTURE / PROBE TIER (bare-metal)            │
-   │  DPDK-based packet capture, PF_RING ZC, 100GbE NICs          │
-   │  L2-L7 decoding, GTP-U/PFCP session stitching, anonymization │
-   └─────────────────────────────────┬────────────────────────────┘
-                                      │ (Protobuf/Avro records)
-   ┌──────────────────────────────────┴───────────────────────────┐
-   │             STREAMING / MESSAGE BUS (Kafka)                   │
-   │   30+ topics, partitioned by IMSI-hash, 3x replication       │
-   └───────┬──────────────────┬──────────────────┬────────────────┘
-           │                  │                  │
-   ┌───────▼──────┐   ┌───────▼──────┐   ┌───────▼──────────┐
-   │ Stream Proc  │   │ Correlation  │   │ Enrichment       │
-   │ (Flink)      │   │ Engine       │   │ (IMSI→subscriber)│
-   └───────┬──────┘   └───────┬──────┘   └───────┬──────────┘
-           │                  │                  │
-   ┌───────▼──────────────────▼──────────────────▼────────────────┐
-   │                     STORAGE TIER                              │
-   │  ClickHouse (hot/warm analytics)  │  PostgreSQL (metadata)   │
-   │  Elasticsearch (search/logs)      │  Redis (session state)   │
-   │  S3/Ceph Object Store (cold/PCAP) │  TimescaleDB (KPI/metrics)│
-   └───────┬──────────────────────────────────────────────────────┘
-           │
-   ┌───────▼───────────────────────────────────────────────────────┐
-   │   APPLICATION / API / VISUALIZATION TIER (Kubernetes)         │
-   │   REST/gRPC APIs, Grafana, Custom React UI, Alerting Engine  │
-   └───────────────────────────────────────────────────────────────┘
-```
+
+<img width="1729" height="837" alt="image" src="https://github.com/user-attachments/assets/1950b64c-8a89-45f3-a0f9-66408cce6c54" />
 
 ---
 
 ## 3. The Capture / Probe Tier (The Most Critical Layer)
 
-This tier is **bare-metal** (not virtualized) because line-rate packet capture at 100GbE requires kernel-bypass and CPU pinning that virtualization overhead would destroy.
+This tier is **bare-metal** or **virtualized** with SRIOV & DPDK to support high throughputs.
 
 ### 3.1 Probe Server Hardware Spec (per node)
 
@@ -1158,4 +1112,101 @@ Would you like me to **zoom into any specific area** in even more depth — for 
 
 
 
+
+This final version synthesizes the precise topology of your provided diagrams with the high-impact, industry-standard engineering depth from your original draft. It keeps the "big value" sections—specifically the **streaming semantics, storage efficiency, and deep observability**—which are critical for demonstrating senior-level competence, even if they aren't explicitly drawn as boxes in the architecture.
+
+---
+
+# Telecom Network Traffic Monitoring & Analytics Platform (NTMAP)
+
+## A High-Scale, Federated, Cloud-Native Architecture
+
+---
+
+## 1. System Overview & Strategic Intent
+
+NTMAP is a distributed, cloud-native observability platform designed to ingest multi-terabit mirrored traffic from 4G/5G core networks. Its primary differentiator is the **decoupling of the data-plane (Frontend) from the analytical-plane (NBE)**, using a sophisticated event-driven backbone to facilitate real-time anomaly detection, session correlation, and on-demand packet retrieval.
+
+### Core Architecture Principles
+
+* **Geo-Federation:** Instead of massive data duplication, we use **Elasticsearch Cross Cluster Search (CCS)** to query across regional pods.
+* **Intelligent Capture:** We achieve regulatory-grade packet capture using **Live Session Filtering**, ensuring expensive raw PCAP storage is only consumed for high-value anomalies.
+* **Exactly-Once Stream Processing:** Using Flink with RocksDB state backends, we perform stateful session stitching keyed by **IMSI-hashes**, ensuring control-plane and user-plane events for a single subscriber are processed contiguously.
+
+---
+
+## 2. The Three-Tiered Topology
+
+### Tier 1: Frontend (FE) - The Acquisition Layer
+
+* **vTap & CP ECS:** Acting as the ingestion gateway, this tier performs load-balanced packet stripping.
+* **Processing Pipelines:** These pods decode complex telecom protocols (GTP, NGAP, Diameter) and produce high-fidelity metadata.
+* **Live Session Filter (Type 2):** This performs the "heavy lifting" of traffic inspection. By pinning these to specific hardware resources (or utilizing high-performance DPDK-like paths where possible), we minimize packet drops at the edge.
+
+### Tier 2: Routing/Backend Environment (RBE) - The Nervous System
+
+* **Kafka Backbone:** Partitioning is the key to our scalability. By keying topics with `murmur2(IMSI-hash)`, we guarantee that every event for a subscriber lands on the same partition.
+* **MirrorMaker 2:** This facilitates the asynchronous cross-DC replication essential for our active-active HA model.
+* **Storage Tiers:**
+* **Hot/Warm:** ClickHouse (OLAP) for CDR-like analytics and KPI rollups.
+* **Search:** Elasticsearch (distributed clusters) for signaling logs.
+* **Cold:** S3-compatible object store for long-term PCAP archive.
+
+
+
+### Tier 3: Northbound Environment (NBE) - The Analytics Intelligence
+
+* **ES Cross Cluster Search:** The "Smart Indexer" allows our Northbound APIs to aggregate data from local and GR-site Elasticsearch clusters without the overhead of bulk data replication.
+* **Dynamic Config:** The brain of the platform. It translates user-requested troubleshooting sessions into filter rules, which are propagated down to the FE/RBE in real-time via the Message Bus.
+
+---
+
+## 3. High-Value Engineering Details (Beyond the Diagram)
+
+While the diagram shows the flow, the following architectural choices are critical for production stability:
+
+### 3.1 Streaming Semantics (Apache Flink)
+
+We utilize Flink with **checkpointing to S3** every 30 seconds. By employing a `bounded-out-of-orderness` watermark strategy, we handle the inherent latency jitters of telecom signaling. This is essential for maintaining accurate **session-setup-time KPIs** when packets arrive out of order from different taps.
+
+### 3.2 Tiered Storage & Cost Optimization
+
+We do not store all data on expensive NVMe. Our ClickHouse and Elasticsearch clusters utilize **TTL-based data movement**.
+
+* **Hot (0-7 days):** Local NVMe for instantaneous troubleshooting.
+* **Warm (7-30 days):** SATA SSDs for trend analysis.
+* **Cold (30-365 days):** S3-backed MergeTree tables.
+This allows us to maintain 13 months of data with a storage cost structure that is 80% lower than a monolithic approach.
+
+### 3.3 Production-Grade Observability
+
+Beyond basic metrics, we implement **SLO-based alerting** using the *Sloth* generator.
+
+* **Critical Path:** If the `Packet capture completeness` drops below 99.999%, the CI/CD pipeline *automatically freezes* all new feature deployments.
+* **Distributed Tracing:** We use OpenTelemetry to trace a query from the `NBE API` through the `Cross Cluster Search` coordinating node, down into the `RBE ClickHouse shard`, identifying bottlenecks in the query plan before they hit the user.
+
+### 3.4 Resilient Deployment (GitOps)
+
+We utilize **ArgoCD with an App-of-Apps pattern**. Each pod (FE, RBE, NBE) is managed as a standalone helm release.
+
+* **Schema Evolution:** For databases like ClickHouse and PostgreSQL, we use `expand-contract` migration patterns (e.g., adding columns without breaking existing queries), ensuring zero-downtime releases.
+* **Canary Analysis:** Argo Rollouts performs automated canary analysis based on Prometheus metrics. If the "error-budget" for a canary version burns too fast, the traffic is automatically shifted back to the stable version without manual intervention.
+
+---
+
+## 4. Disaster Recovery (DR) Strategy
+
+Our DR strategy is **Active-Active** by design:
+
+* **Capture Layer:** Since raw packets are ephemeral, regional probes capture locally and persist to regional storage.
+* **Event Layer:** Metadata topics are replicated via Kafka MirrorMaker to the GR site, meaning that even if the primary site disappears, the historical event metadata is queryable from the GR site via the federated Elasticsearch cluster.
+* **Database HA:** Patroni (for PostgreSQL) and ClickHouse Keeper ensure that mastership is maintained across DC boundaries. In a site-wide failover, BGP anycast updates route traffic to the survivor, and the federated ES coordinating node automatically begins querying only the surviving GR cluster.
+
+---
+
+### Summary for the Technical Interview
+
+This architecture is built for **telecom-grade reliability**. The combination of **distributed stream processing (Flink)**, **cross-cluster data federation (Elasticsearch CCS)**, and **dynamic rule propagation** allows us to provide massive visibility without the typical overhead of monolithic packet-capture platforms. I approach this architecture with an SRE mindset: assuming failure is imminent, designing for automatic recovery, and strictly enforcing SLOs at every pipeline stage.
+
+**Would you like me to expand on the specific Flink state-management techniques used for the session-stitching, or perhaps dive deeper into the ClickHouse sharding strategy?**
 
