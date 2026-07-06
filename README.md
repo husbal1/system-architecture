@@ -334,7 +334,7 @@ Consider this exercise as the first part of a whiteboard interview question - as
 
 ## 1. System Overview & Business Context
 
-**NTMAP** (Network Traffic Monitoring & Analytics Platform) is a passive monitoring system deployed in a Tier-1 telecom operator's network. It receives **mirrored (SPAN/TAP) traffic** from the control and user planes of the 4G (EPC) and 5G (5GC) core network functions, decodes telecom protocols in real time, correlates sessions across network functions, detects anomalies/fraud/SLA violations, and feeds dashboards + alerting + long-term analytics.
+**NTMAP** is a distributed, cloud-native observability platform designed to ingest multi-terabit mirrored traffic from 4G/5G core networks. Its primary differentiator is the **decoupling of the data-plane (Frontend) from the analytical-plane (NBE)**, using a sophisticated event-driven backbone to facilitate real-time anomaly detection, session correlation, and on-demand packet retrieval.
 
 ### 1.1 What it monitors
 
@@ -362,29 +362,80 @@ Alert end-to-end latency............. < 2 seconds (p95)
 
 ## 2. High-Level Architecture
 
-```
+<img width="1606" height="979" alt="3bc3f797-9a7a-4643-8069-9fa5855191b3" src="https://github.com/user-attachments/assets/f33e93e0-1b2f-423e-97c9-416d30bb3168" />
 
-<img width="1729" height="837" alt="image" src="https://github.com/user-attachments/assets/1950b64c-8a89-45f3-a0f9-66408cce6c54" />
+### Core Architecture Principles
+
+* **Geo-Federation:** Instead of massive data duplication, we use **Elasticsearch Cross Cluster Search (CCS)** to query across regional pods.
+* **Intelligent Capture:** We achieve regulatory-grade packet capture using **Live Session Filtering**, ensuring expensive raw PCAP storage is only consumed for high-value anomalies.
 
 ---
 
-## 3. The Capture / Probe Tier (The Most Critical Layer)
+## 3. The Three-Tiered Topology
+
+### Tier 1: Frontend (FE) - The Acquisition Layer
+
+* **vTap & CP ECS:** Acting as the ingestion gateway, this tier performs load-balanced packet stripping.
+* **Processing Pipelines:** These pods decode complex telecom protocols (GTP, NGAP, Diameter) and produce high-fidelity metadata.
+* **Live Session Filter (Type 2):** This performs the "heavy lifting" of traffic inspection. By pinning these to specific hardware resources (or utilizing high-performance DPDK-like paths where possible), we minimize packet drops at the edge.
+
+### Tier 2: Routing/Backend Environment (RBE) - The Nervous System
+
+* **Kafka Backbone:** Partitioning is the key to our scalability. By keying topics with `murmur2(IMSI-hash)`, we guarantee that every event for a subscriber lands on the same partition.
+* **MirrorMaker 2:** This facilitates the asynchronous cross-DC replication essential for our active-active HA model.
+* **Storage Tiers:**
+* **Hot/Warm:** ClickHouse (OLAP) for CDR-like analytics and KPI rollups.
+* **Search:** Elasticsearch (distributed clusters) for signaling logs.
+* **Cold:** S3-compatible object store for long-term PCAP archive.
+
+### Tier 3: National Backend Environment (NBE) - The Analytics Intelligence
+
+* **ES Cross Cluster Search:** The "Smart Indexer" allows the APIs to aggregate data from local and GR-site Elasticsearch clusters without the overhead of bulk data replication.
+* **Dynamic Config:** The brain of the platform. It translates user-requested troubleshooting sessions into filter rules, which are propagated down to the FE/RBE in real-time via the Message Bus.
+
+---
+
+## 4. High-Value Engineering Details (Beyond the Diagram)
+
+While the diagram shows the flow, the following architectural choices are critical for production stability:
+
+### 4.1 Streaming Semantics (Apache Flink)
+
+We utilize Flink with **checkpointing to S3** every 30 seconds. By employing a `bounded-out-of-orderness` watermark strategy, we handle the inherent latency jitters of telecom signaling. This is essential for maintaining accurate **session-setup-time KPIs** when packets arrive out of order from different taps.
+
+### 4.2 Tiered Storage & Cost Optimization
+
+We do not store all data on expensive NVMe. Our ClickHouse and Elasticsearch clusters utilize **TTL-based data movement**.
+
+* **Hot (0-7 days):** Local NVMe for instantaneous troubleshooting.
+* **Warm (7-30 days):** SATA SSDs for trend analysis.
+* **Cold (30-365 days):** S3-backed MergeTree tables.
+This allows us to maintain 13 months of data with a storage cost structure that is 80% lower than a monolithic approach.
+
+### 4.3 Resilient Deployment (GitOps)
+
+We utilize **ArgoCD with an App-of-Apps pattern**. Each pod (FE, RBE, NBE) is managed as a standalone helm release.
+
+* **Canary Analysis:** Argo Rollouts performs automated canary analysis based on Prometheus metrics. If the "error-budget" for a canary version burns too fast, the traffic is automatically shifted back to the stable version without manual intervention.
+
+---
+
+## 5. Disaster Recovery (DR) Strategy
+
+Our DR strategy is **Active-Active** by design:
+
+* **Capture Layer:** Since raw packets are ephemeral, regional probes capture locally and persist to regional storage.
+* **Event Layer:** Metadata topics are replicated via Kafka MirrorMaker to the GR site, meaning that even if the primary site disappears, the historical event metadata is queryable from the GR site via the federated Elasticsearch cluster.
+
+---
+
+---
+
+## 6. The Capture / Probe Tier (The Most Critical Layer)
 
 This tier is **bare-metal** or **virtualized** with SRIOV & DPDK to support high throughputs.
 
-### 3.1 Probe Server Hardware Spec (per node)
-
-```
-CPU.............. 2× AMD EPYC 9554 (64-core each) — 128 physical cores
-RAM.............. 1 TB DDR5 (NUMA-aware, hugepages reserved: 256 GB)
-NICs............. 4× NVIDIA/Mellanox ConnectX-7 (100GbE), DPDK-bound
-                  + 1× 25GbE management NIC (kernel-bound)
-Storage.........  2× 1.92TB NVMe (OS, RAID1)
-                  8× 7.68TB NVMe (ring-buffer PCAP, RAID0)
-Boot............. PXE + iPXE, immutable OS image
-```
-
-### 3.2 Software Stack on Probe
+### 6.1 Software Stack on Probe
 
 ```
 ┌──────────────────────────────────────────────────────────┐
@@ -404,19 +455,6 @@ Boot............. PXE + iPXE, immutable OS image
                  64-67 OS, 68-127 RX/decode (NUMA1)
    Hugepages: 1GB pages, mbuf pools per NUMA node
 ```
-
-### 3.3 Key Operational Parameters
-
-| Parameter | Value | Why |
-|---|---|---|
-| Packet drop threshold (alert) | > 0.001% | Lawful-intercept compliance needs near-zero loss |
-| Ring buffer size | 60 GB per NIC | ~5 sec of full-rate PCAP for retro-analysis |
-| Flow table size | 80M entries | Covers concurrent sessions + headroom |
-| Flow idle timeout | 300 s (UDP), 3600 s (TCP) | Matches GTP-U session lifetimes |
-| Hugepage allocation | 256 GB | mbuf pools must never starve |
-| Decoder worker threads | 56 per NUMA node | One per pinned core |
-
----
 
 ## 4. Environments: Dev / Test / Staging / Production
 
@@ -459,50 +497,10 @@ TEST: Curated PCAP corpus (12 TB) of:
       - Regression cases (every past production bug → a PCAP)
 ```
 
----
-
-## 5. CI/CD Pipeline
-
-```
-Developer
-   │ git push (feature branch)
-   ▼
-┌──────────────────────────────────────────────────────────────┐
-│  GitLab CI / ArgoCD (GitOps)                                  │
-│                                                               │
-│  STAGE 1: Build & Static Analysis                            │
-│    • Compile probe (C++/Rust) with -Werror                   │
-│    • clang-tidy, cppcheck, cargo clippy                      │
-│    • SAST (Semgrep, Coverity), SBOM generation (Syft)        │
-│    • Container image build (multi-stage, distroless)         │
-│    • Sign images (cosign), scan (Trivy/Grype)               │
-│                                                               │
-│  STAGE 2: Unit + Component Tests                             │
-│    • 8,000+ unit tests, decoder golden-file tests           │
-│    • Protocol decoder fuzzing (AFL++, 30 min budget)        │
-│    • Coverage gate: ≥ 80% line, ≥ 70% branch                │
-│                                                               │
-│  STAGE 3: Integration Tests (ephemeral k8s namespace)       │
-│    • Spin full stack via Helm in throwaway namespace        │
-│    • Replay 500 GB PCAP, assert record counts & KPIs        │
-│    • Contract tests (Pact) for API consumers                │
-│                                                               │
-│  STAGE 4: Performance / Soak (nightly, dedicated HW)        │
-│    • TRex line-rate test: assert 0 drops @ 100GbE/probe     │
-│    • 8-hour soak: memory-leak detection, latency p99        │
-│                                                               │
-│  STAGE 5: Deploy                                            │
-│    • DEV: auto on merge to develop                          │
-│    • STAGING: auto on merge to main + manual approval       │
-│    • PROD: manual approval + change-ticket + canary         │
-└──────────────────────────────────────────────────────────────┘
-```
-
-### 5.1 Production Deployment Strategy
+## 5 Production Deployment Strategy
 
 - **Applications (k8s tier):** Argo Rollouts **canary** — 5% → 25% → 50% → 100%, with automatic rollback if SLO error budget burns (Prometheus-based analysis).
-- **Probes (bare-metal):** **Rolling, NPB-coordinated.** Because probes are stateless-ish capture nodes behind the packet broker, we drain one probe at a time. The NPB redistributes its flow-hash buckets to peers, we reflash the OS image (immutable), reboot, validate zero-drop, then return it to the hash pool. ~6 probes upgraded per maintenance window.
-- **Database schema changes:** Expand-contract migrations (gh-ost / ClickHouse `ON CLUSTER` DDL), never destructive in a single release.
+- **Probes (bare-metal):** **Rolling, NPB-coordinated.** Because probes are stateless-ish capture nodes behind the packet broker, we drain one probe at a time. The NPB redistributes its flow-hash buckets to peers.
 
 ---
 
@@ -544,256 +542,9 @@ Subscriber session correlation requires that the control-plane event (e.g., GTP-
 
 ---
 
-## 7. Stream Processing & Correlation (Apache Flink)
+## 7. Monitoring, Observability & Alerting
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│  Flink Application Cluster (Kubernetes, 60 TaskManagers)    │
-│                                                             │
-│  Job 1: Session Correlation                                │
-│    Source(gtpc) ─┐                                         │
-│    Source(gtpu) ─┼→ KeyBy(IMSI) → Stateful Window Join →   │
-│    Source(pfcp) ─┘    (RocksDB state backend)              │
-│                       → Enriched Session Record            │
-│                                                             │
-│  Job 2: KPI Aggregation                                    │
-│    → Tumbling 1-min windows: attach success rate,          │
-│      session setup time, throughput per cell/APN/slice     │
-│                                                             │
-│  Job 3: Anomaly / Fraud Detection                          │
-│    → CEP patterns: SIM-box detection, signaling storms,    │
-│      DDoS on control plane, abnormal roaming patterns      │
-│                                                             │
-│  State backend: RocksDB on local NVMe                      │
-│  Checkpointing: every 30s → S3 (incremental, exactly-once) │
-│  Savepoints: before every deploy → S3                      │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### 7.1 Flink Operational Parameters
-
-| Parameter | Value |
-|---|---|
-| Parallelism (Job 1) | 480 (matches partition count) |
-| Checkpoint interval | 30 s |
-| Checkpoint timeout | 5 min |
-| State size (steady) | ~4 TB across cluster |
-| Restart strategy | exponential-delay, max 10 attempts |
-| Watermark strategy | bounded-out-of-orderness, 10 s |
-| Allowed lateness | 60 s (then → side-output / DLQ) |
-
----
-
-## 8. Storage Tier — Databases in Detail
-
-### 8.1 Database-by-Purpose Map
-
-```
-┌──────────────────┬────────────────────────────────┬──────────────┐
-│  Database        │  Purpose                        │  Data Type   │
-├──────────────────┼────────────────────────────────┼──────────────┤
-│ ClickHouse       │ Analytical queries, CDR-like    │ Columnar OLAP│
-│                  │ records, traffic analytics      │              │
-│ TimescaleDB      │ Time-series KPIs / network      │ Time-series  │
-│ (PostgreSQL ext) │ metrics for Grafana             │              │
-│ PostgreSQL       │ Config, topology, users, rules, │ Relational   │
-│                  │ alert definitions, RBAC         │ OLTP         │
-│ Elasticsearch    │ Full-text search over signaling │ Search index │
-│                  │ logs, troubleshooting           │              │
-│ Redis (Cluster)  │ Hot session cache, rate-limit,  │ KV / in-mem  │
-│                  │ enrichment lookup (IMSI→profile)│              │
-│ Ceph / S3        │ Cold PCAP archive, lawful       │ Object store │
-│                  │ intercept, Flink checkpoints    │              │
-└──────────────────┴────────────────────────────────┴──────────────┘
-```
-
-### 8.2 ClickHouse — The Analytical Workhorse
-
-```
-Production ClickHouse Cluster
-┌────────────────────────────────────────────────────────────┐
-│  48 nodes = 24 shards × 2 replicas                          │
-│  Coordination: ClickHouse Keeper (Raft, 5 nodes)           │
-│                                                            │
-│  Shard 1        Shard 2        ...      Shard 24           │
-│  ┌────┬────┐    ┌────┬────┐             ┌────┬────┐        │
-│  │ R1 │ R2 │    │ R1 │ R2 │             │ R1 │ R2 │        │
-│  └────┴────┘    └────┴────┘             └────┴────┘        │
-│   DC1   DC2      DC1   DC2               DC1   DC2          │
-│   (cross-DC replica placement for DR)                     │
-│                                                            │
-│  Engine: ReplicatedMergeTree                              │
-│  Distributed table fans out queries across shards         │
-│                                                            │
-│  Per node: 64 cores, 512 GB RAM, 24× 7.68TB NVMe (RAID10) │
-└────────────────────────────────────────────────────────────┘
-```
-
-**Table design example (records table):**
-
-```sql
-CREATE TABLE session_records ON CLUSTER ntmap
-(
-    event_time      DateTime64(3) CODEC(DoubleDelta, ZSTD),
-    imsi_hash       UInt64,
-    msisdn_hash     UInt64,
-    cell_id         UInt32,
-    apn             LowCardinality(String),
-    slice_id        LowCardinality(String),  -- 5G S-NSSAI
-    proto           LowCardinality(String),
-    bytes_up        UInt64 CODEC(T64, ZSTD),
-    bytes_down      UInt64 CODEC(T64, ZSTD),
-    setup_time_ms   UInt32,
-    cause_code      Int16,
-    -- ... 40+ more columns
-)
-ENGINE = ReplicatedMergeTree('/clickhouse/{shard}/session_records','{replica}')
-PARTITION BY toYYYYMMDD(event_time)
-ORDER BY (apn, cell_id, imsi_hash, event_time)
-TTL event_time + INTERVAL 30 DAY TO VOLUME 'cold',     -- tiered storage
-    event_time + INTERVAL 13 MONTH DELETE
-SETTINGS storage_policy = 'hot_warm_cold';
-```
-
-**Tiered storage policy:**
-```
-hot   → local NVMe        (0–7 days,  fastest queries)
-warm  → local SATA SSD    (7–30 days)
-cold  → S3-backed disk    (30 days–13 months, MergeTree on object store)
-```
-
-### 8.3 Materialized Views for Real-Time Rollups
-
-```sql
--- Pre-aggregate per-cell KPIs at insert time
-CREATE MATERIALIZED VIEW mv_cell_kpi_1min
-ENGINE = ReplicatedAggregatingMergeTree(...)
-AS SELECT
-    toStartOfMinute(event_time) AS minute,
-    cell_id,
-    countState() AS sessions,
-    avgState(setup_time_ms) AS avg_setup,
-    sumState(bytes_up + bytes_down) AS total_bytes
-FROM session_records
-GROUP BY minute, cell_id;
-```
-
----
-
-## 9. Backup & Replication Strategy (Per Datastore)
-
-### 9.1 Summary Table
-
-```
-┌──────────────┬──────────────────┬───────────────┬──────────┬────────┐
-│ Datastore    │ Replication      │ Backup Method │ RPO      │ RTO    │
-├──────────────┼──────────────────┼───────────────┼──────────┼────────┤
-│ ClickHouse   │ Native repl ×2   │ clickhouse-   │ ~0       │ <30min │
-│              │ (cross-DC)       │ backup → S3   │ (replica)│        │
-│              │                  │ incremental/3h│ 3h(backup)│       │
-│ PostgreSQL   │ Streaming repl   │ pgBackRest    │ <5s      │ <10min │
-│              │ (sync to 1,async │ (WAL archiving│          │        │
-│              │  to 2) + Patroni │ + full daily) │          │        │
-│ TimescaleDB  │ Same as PG       │ pgBackRest +  │ <5s      │ <10min │
-│              │                  │ chunk export  │          │        │
-│ Elasticsearch│ 1 primary +      │ Snapshot to   │ 15min    │ <30min │
-│              │ 1 replica shard  │ S3 repository │          │        │
-│ Redis        │ Cluster + repl   │ RDB+AOF → S3  │ 1s (AOF) │ <5min  │
-│              │ (each master+1)  │ hourly RDB    │          │        │
-│ Kafka        │ Repl factor 3 +  │ Tiered storage│ ~0       │ <15min │
-│              │ MirrorMaker2 →DR │ to S3 + MM2   │          │        │
-│ Ceph/S3      │ Erasure-coded +  │ Cross-region  │ async    │ N/A    │
-│              │ multi-site repl  │ replication   │ ~15min   │        │
-└──────────────┴──────────────────┴───────────────┴──────────┴────────┘
-```
-
-### 9.2 PostgreSQL HA in Detail (Patroni + etcd)
-
-```
-┌─────────────────────────────────────────────────────────┐
-│              PostgreSQL HA Cluster (Patroni)             │
-│                                                          │
-│   DC1                          DC2                       │
-│  ┌──────────┐   sync repl    ┌──────────┐               │
-│  │ Primary  │ ─────────────→ │ Sync     │               │
-│  │ (Leader) │                │ Standby  │               │
-│  └────┬─────┘                └──────────┘               │
-│       │ async repl                                       │
-│       └──────────────────→  ┌──────────┐                │
-│                             │ Async    │ (read replica  │
-│                             │ Standby  │  + DR)         │
-│                             └──────────┘                │
-│                                                         │
-│   Patroni agents manage leader election via etcd (5     │
-│   nodes). HAProxy/PgBouncer routes writes → leader,     │
-│   reads → standbys. Automatic failover < 30s.           │
-│                                                         │
-│   WAL archived continuously via pgBackRest to S3.       │
-│   Full backup: daily. Differential: every 6h.          │
-│   PITR (point-in-time-recovery) granularity: per-txn.  │
-└─────────────────────────────────────────────────────────┘
-```
-
-### 9.3 Backup Verification (Critical — backups you don't test are not backups)
-
-- **Nightly automated restore drills:** A dedicated "restore-validation" namespace restores the *latest* PostgreSQL and ClickHouse backups, runs schema/row-count/checksum assertions, then tears down. Failures page the on-call DBA.
-- **Quarterly full DR game-day:** Simulated DC1 total loss → fail over to DC2 → validate full functionality → measure actual RTO/RPO against targets.
-
----
-
-## 10. Disaster Recovery & High Availability (DR-HA)
-
-### 10.1 Multi-DC Topology
-
-```
-┌────────────────────────────┐      ┌────────────────────────────┐
-│        DC1 (Primary)       │      │     DC2 (Active-DR)        │
-│  ─────────────────────────  │      │  ────────────────────────  │
-│  • 24 probes (50% traffic) │      │  • 16 probes (region 2)    │
-│  • Kafka brokers 1-12      │◄────►│  • Kafka brokers 13-24     │
-│  • ClickHouse shards 1-12  │ Mirr.│  • ClickHouse shards 13-24 │
-│  • PG Primary              │ Maker│  • PG Sync Standby         │
-│  • Flink active jobs       │  2   │  • Flink standby (savepts) │
-│  • Full app tier           │      │  • Full app tier (active)  │
-└──────────────┬─────────────┘      └─────────────┬──────────────┘
-               │     Dark fiber, 2× 400GbE         │
-               │     <2ms latency, BGP anycast     │
-               └───────────────┬───────────────────┘
-                               ▼
-                   ┌────────────────────┐
-                   │   DC3 (Cold DR)    │
-                   │  S3 cross-region   │
-                   │  backup target +   │
-                   │  IaC to rebuild    │
-                   └────────────────────┘
-```
-
-**Design philosophy: Active-Active for capture & ingest (each DC monitors its regional network functions), Active-Passive for the stateful write-primary databases.**
-
-### 10.2 Failure Scenarios & Responses
-
-| Failure | Detection | Automated Response | Manual? |
-|---|---|---|---|
-| Single probe dies | NPB heartbeat + Prometheus | NPB redistributes flow buckets; alert | No |
-| Kafka broker dies | Controller detects | Partitions re-elect leaders (ISR) | No |
-| ClickHouse replica dies | Keeper detects | Queries route to surviving replica | No |
-| PG primary dies | Patroni/etcd | Auto-failover to sync standby (<30s) | No |
-| Entire DC1 lost | Multi-signal (BGP, health) | DC2 promotes PG, Flink restores from savepoint, anycast withdraws DC1 | Approval gate |
-| Both DCs lost | — | Rebuild from DC3 via IaC + S3 restore | Yes (full runbook) |
-
-### 10.3 Capture-Layer Resilience (the hard part)
-
-Because mirrored packets are **ephemeral** (you can't "re-request" a packet that already passed), the capture tier must never drop. Mitigations:
-
-1. **NPB-level load balancing** with N+1 probe redundancy per traffic group.
-2. **Rolling 60s ring buffers** on each probe — if downstream Kafka stalls, the probe keeps capturing to local NVMe and back-pressures gracefully.
-3. **Dual-feed critical interfaces** (S6a/Diameter, N7/N12) tapped to two independent probes for zero-loss compliance interfaces.
-
----
-
-## 11. Monitoring, Observability & Alerting
-
-### 11.1 The Observability Stack ("monitoring the monitor")
+### 7.1 The Observability Stack ("monitoring the monitor")
 
 ```
 ┌───────────────────────────────────────────────────────────┐
@@ -818,7 +569,7 @@ Because mirrored packets are **ephemeral** (you can't "re-request" a packet that
 └───────────────────────────────────────────────────────────┘
 ```
 
-### 11.2 Key SLOs & Golden Signals
+### 7.2 Key SLOs & Golden Signals
 
 ```
 ┌─────────────────────────────┬──────────┬────────────────────┐
@@ -832,95 +583,9 @@ Because mirrored packets are **ephemeral** (you can't "re-request" a packet that
 └─────────────────────────────┴──────────┴────────────────────┘
 ```
 
-### 11.3 Critical Alerts (sample)
+## 8. Auto-Scaling Strategy
 
-```yaml
-# Probe packet drops - PAGE immediately (compliance risk)
-- alert: ProbePacketDropHigh
-  expr: rate(probe_rx_dropped_packets_total[1m]) 
-        / rate(probe_rx_packets_total[1m]) > 0.00001
-  for: 30s
-  severity: critical
-  annotations:
-    runbook: "https://runbooks/probe-drops"
-
-# Kafka consumer lag growing - pipeline falling behind
-- alert: KafkaConsumerLagGrowing
-  expr: kafka_consumergroup_lag > 5000000 
-        and deriv(kafka_consumergroup_lag[5m]) > 0
-  for: 5m
-  severity: critical
-
-# ClickHouse merge backlog - ingest will stall soon
-- alert: ClickHouseMergeBacklog
-  expr: clickhouse_async_metric_MaxPartCountForPartition > 300
-  for: 10m
-  severity: warning
-```
-
----
-
-## 12. Infrastructure Management & Automation (IaC)
-
-### 12.1 Tooling Layers
-
-```
-┌──────────────────────────────────────────────────────────┐
-│  LAYER 1: Physical / Bare-metal provisioning             │
-│    • MAAS (Metal-as-a-Service) — PXE boot, OS deploy     │
-│    • Foreman + Ironic for hardware lifecycle             │
-│    • Immutable OS images (built via Packer, signed)      │
-│                                                          │
-│  LAYER 2: Infrastructure provisioning                    │
-│    • Terraform (network, storage, k8s clusters, DNS)    │
-│    • Terragrunt for env DRY config                      │
-│    • State in remote backend (S3 + DynamoDB lock)       │
-│                                                          │
-│  LAYER 3: Configuration management                       │
-│    • Ansible (probe tuning: hugepages, CPU pinning,     │
-│      NIC IRQ affinity, DPDK binding, sysctl)            │
-│                                                          │
-│  LAYER 4: Application orchestration                      │
-│    • Kubernetes (app/stream/storage-operator tiers)     │
-│    • Helm charts + ArgoCD (GitOps, app-of-apps pattern) │
-│    • Operators: Strimzi (Kafka), ClickHouse Operator,   │
-│      Flink Operator, Zalando Postgres Operator          │
-│                                                          │
-│  LAYER 5: Policy & Security                              │
-│    • OPA/Gatekeeper (admission policies)                │
-│    • Kyverno, Falco (runtime security)                  │
-│    • Vault (secrets, PKI, dynamic DB creds)             │
-└──────────────────────────────────────────────────────────┘
-```
-
-### 12.2 Example: Probe Tuning via Ansible (excerpt)
-
-```yaml
-- name: Configure DPDK hugepages
-  sysctl:
-    name: vm.nr_hugepages
-    value: "256"        # 256 × 1GB pages
-  
-- name: Pin NIC IRQs to NUMA-local cores
-  shell: |
-    set_irq_affinity.sh -x local mlx5_core
-    
-- name: Isolate cores from scheduler (kernel cmdline)
-  lineinfile:
-    path: /etc/default/grub
-    regexp: '^GRUB_CMDLINE_LINUX'
-    line: 'GRUB_CMDLINE_LINUX="isolcpus=4-63,68-127 
-           nohz_full=4-63,68-127 rcu_nocbs=4-63,68-127 
-           default_hugepagesz=1G hugepagesz=1G hugepages=256 
-           intel_iommu=on iommu=pt"'
-  notify: regenerate grub & reboot
-```
-
----
-
-## 13. Auto-Scaling Strategy
-
-### 13.1 What scales how
+### 8.1 What scales how
 
 ```
 ┌─────────────────┬──────────────────────────────────────────┐
@@ -930,271 +595,42 @@ Because mirrored packets are **ephemeral** (you can't "re-request" a packet that
 │                 │ adding NPB capacity + new probe nodes     │
 │                 │ (capacity planning quarterly)             │
 │                 │                                           │
-│ Flink           │ Reactive autoscaling (Flink Autoscaler)   │
-│                 │ based on Kafka lag + backpressure metrics │
 │                 │                                           │
 │ App/API tier    │ HPA (Horizontal Pod Autoscaler) on CPU + │
 │                 │ custom metrics (req/s, p95 latency);     │
 │                 │ KEDA for Kafka-lag-driven scaling        │
 │                 │                                           │
-│ ClickHouse      │ Vertical first; horizontal by re-sharding │
-│                 │ (planned, since rebalancing is heavy)    │
-│                 │                                           │
-│ Kafka           │ Add brokers + Cruise Control auto-rebal. │
-│                 │ partition reassignment                    │
 │                 │                                           │
 │ k8s nodes       │ Cluster Autoscaler (cloud) / fixed       │
 │                 │ capacity pools (on-prem)                 │
 └─────────────────┴──────────────────────────────────────────┘
 ```
 
-### 13.2 KEDA Example — Scale API consumers on Kafka lag
-
-```yaml
-apiVersion: keda.sh/v1alpha1
-kind: ScaledObject
-metadata:
-  name: enrichment-consumer-scaler
-spec:
-  scaleTargetRef:
-    name: enrichment-service
-  minReplicaCount: 6
-  maxReplicaCount: 60
-  triggers:
-  - type: kafka
-    metadata:
-      bootstrapServers: kafka:9092
-      consumerGroup: enrichment-grp
-      topic: enriched.sessions
-      lagThreshold: "50000"   # scale up when lag > 50k per replica
-```
-
----
-
-## 14. Security & Compliance
+## 9. Security & Compliance
 
 Telecom data is *extremely* sensitive (subscriber PII, lawful intercept, GDPR).
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│  DATA PROTECTION                                          │
+│  DATA PROTECTION                                         │
 │   • IMSI/MSISDN hashed (HMAC-SHA256, keyed) at PROBE     │
 │     before leaving capture tier — pseudonymization       │
-│   • Reversible mapping vault accessible only to lawful-  │
-│     intercept module under dual-control (4-eyes)         │
-│   • Encryption at rest: LUKS (disks), TDE (ClickHouse), │
-│     S3 SSE-KMS                                            │
-│   • Encryption in transit: mTLS everywhere (SPIFFE/      │
-│     SPIRE workload identity)                              │
+│   • Encryption at rest: LUKS (disks), etc.TDE            │
+│   • Encryption in transit: mTLS everywhere               │
 │                                                          │
 │  ACCESS CONTROL                                          │
 │   • RBAC + ABAC; just-in-time access via Vault           │
-│   • All DB access via PgBouncer/proxy with audit log    │
-│   • Bastion + session recording for prod access         │
+│   • All DB access with audit log                         │
+│   • session recording for prod access                    │
 │                                                          │
 │  COMPLIANCE                                              │
-│   • GDPR: right-to-erasure workflows, data minimization │
-│   • Lawful Intercept (ETSI/3GPP TS 33.108) module       │
+│   • GDPR: right-to-erasure workflows, data minimization  │
+│   • Lawful Intercept (ETSI/3GPP TS 33.108) module        │
 │     air-gapped, separate access domain                   │
-│   • SOC2 / ISO27001 audit logging (immutable, WORM S3)  │
-│   • Data residency: regional data never leaves region   │
+│   • SOC2 / ISO27001 audit logging (immutable, WORM S3)   │
+│   • Data residency: regional data never leaves region    │
 └──────────────────────────────────────────────────────────┘
 ```
 
 ---
-
-## 15. End-to-End Data Flow (Putting it all together)
-
-```
-1. Subscriber attaches to 5G network → AMF/SMF signaling
-                    │
-2. Optical TAP mirrors N1/N2/N4 packets → Network Packet Broker
-                    │  (flow-consistent hash by GTP-TEID/IMSI)
-3. Packet Broker load-balances to Probe #17
-                    │  (DPDK RX, NUMA-local processing)
-4. Probe decodes NGAP+PFCP, builds session record,
-   hashes IMSI, produces Protobuf → Kafka topic ngap.records
-                    │  (partition = murmur2(imsi_hash) % 240)
-5. Flink Job 1 consumes ngap + pfcp + gtpu (same partition),
-   stateful-joins by IMSI → enriched session record
-                    │  (RocksDB state, exactly-once)
-6. Enrichment service adds subscriber profile (Redis lookup)
-                    │
-7. Record written to:
-   • ClickHouse (analytics, 30-day hot)  → Grafana dashboards
-   • Elasticsearch (searchable signaling) → troubleshooting UI
-   • TimescaleDB (KPI rollups)            → SLA reports
-                    │
-8. Flink Job 3 CEP detects signaling storm on this cell
-   → produces to "alerts" topic
-                    │
-9. Alerting Engine → PagerDuty + auto-ticket + Slack
-                    │  (end-to-end < 2 seconds)
-10. NOC engineer queries last 5 min of raw PCAP for the cell
-    → on-demand export from probe ring buffer → root cause
-```
-
----
-
-## 16. Interesting / Advanced Features
-
-1. **On-demand PCAP retrieval:** Each probe keeps a 60-second rolling full-packet buffer. The UI lets an engineer "rewind" and download the exact packets for a subscriber/cell/time window for deep forensic analysis — bridging metadata analytics with raw packet truth.
-
-2. **Decoder hot-reload via WASM:** New/experimental protocol decoders can be deployed as sandboxed WASM modules to probes *without recompiling/redeploying* the whole probe binary, enabling rapid response to new 3GPP releases.
-
-3. **Shadow-deploy decoders:** New decoder versions run in parallel with the old on staging's 5% live feed; outputs are diffed automatically to catch regressions before promotion.
-
-4. **Chaos engineering:** Scheduled chaos (LitmusChaos) kills probes, Kafka brokers, and PG primaries in staging weekly to continuously validate HA assumptions.
-
-5. **Cost/capacity model:** Storage tiering + ClickHouse compression (ZSTD + specialized codecs like `T64`, `DoubleDelta`, `Gorilla`) achieves ~12:1 compression, making 30-day hot retention of 85B records/day economically feasible.
-
-6. **GitOps everything:** The *entire* platform state — including ClickHouse schemas, Kafka topics, Grafana dashboards, and alert rules — is declared in Git. A full DC rebuild is `terraform apply` + `argocd sync` + data restore.
-
----
-
-## 17. Summary Architecture Diagram (Consolidated)
-
-```
-                    ┌──────────────────────────────────────┐
-   TELECOM CORE     │  4G EPC  │  5G Core  │  IMS/VoLTE     │
-   (live traffic)   └────┬─────────┬───────────┬───────────┘
-                         │ TAP/SPAN│           │
-                    ┌────▼─────────▼───────────▼──────┐
-                    │  NETWORK PACKET BROKER (NPB)     │  Gigamon/Arista
-                    └────────────────┬─────────────────┘
-                                     │ balanced 100/400G
-        ┌────────────────────────────┼────────────────────────────┐
-        │  CAPTURE TIER (bare metal, DPDK, 40+ probes)            │
-        │  decode • IMSI-hash • PCAP ring • Protobuf records      │
-        └────────────────────────────┬───────────────────────────┘
-                                      │
-        ┌─────────────────────────────▼──────────────────────────┐
-        │  KAFKA (24 brokers, 3x repl, tiered→S3, MM2→DR)        │
-        └─────────────────────────────┬──────────────────────────┘
-                                      │
-        ┌─────────────────────────────▼──────────────────────────┐
-        │  FLINK (60 TMs, RocksDB, exactly-once, autoscaled)     │
-        │  correlation • KPI • CEP fraud/anomaly                 │
-        └─────┬───────────┬───────────┬───────────┬──────────────┘
-              │           │           │           │
-        ┌─────▼───┐ ┌─────▼────┐ ┌────▼─────┐ ┌───▼──────┐
-        │ClickHse │ │Timescale │ │ Elastic  │ │ Redis    │
-        │48 nodes │ │ (PG/HA)  │ │ search   │ │ cluster  │
-        │OLAP     │ │ KPIs     │ │ search   │ │ session  │
-        └─────┬───┘ └──────────┘ └──────────┘ └──────────┘
-              │           ┌──────────────┐    ┌──────────┐
-              │           │ PostgreSQL   │    │ Ceph/S3  │
-              │           │ (Patroni HA) │    │ cold+PCAP│
-              │           │ config/RBAC  │    │ archive  │
-              │           └──────────────┘    └──────────┘
-        ┌─────▼────────────────────────────────────────────┐
-        │  APP/API/UI TIER (k8s, ArgoCD, HPA/KEDA)         │
-        │  REST/gRPC • React UI • Grafana • Alerting       │
-        └─────────────────────┬─────────────────────────────┘
-                              │
-              ┌───────────────┼───────────────┐
-              │  PagerDuty  │ NOC Engineers │ Reports │
-              └─────────────────────────────────────┘
-
-   CROSS-CUTTING:  Prometheus+Thanos | Loki | Tempo | Vault |
-                   Terraform | Ansible | MAAS | OPA/Falco
-   DR:  DC1 (primary) ⇄ DC2 (active-DR) → DC3 (cold/S3)
-```
-
----
-
-This gives you the full picture — from optical taps and DPDK kernel-bypass at the wire, through streaming correlation, into tiered analytical storage, wrapped in GitOps automation, multi-DC DR, and five-nines observability.
-
-Would you like me to **zoom into any specific area** in even more depth — for example: the **exactly-once Flink state recovery mechanics**, the **ClickHouse resharding procedure**, the **detailed DR failover runbook**, or the **lawful-intercept compliance subsystem**?
-
-
-
-
-
-
-
-This final version synthesizes the precise topology of your provided diagrams with the high-impact, industry-standard engineering depth from your original draft. It keeps the "big value" sections—specifically the **streaming semantics, storage efficiency, and deep observability**—which are critical for demonstrating senior-level competence, even if they aren't explicitly drawn as boxes in the architecture.
-
----
-
-# Telecom Network Traffic Monitoring & Analytics Platform (NTMAP)
-
-## A High-Scale, Federated, Cloud-Native Architecture
-
----
-
-## 1. System Overview & Strategic Intent
-
-NTMAP is a distributed, cloud-native observability platform designed to ingest multi-terabit mirrored traffic from 4G/5G core networks. Its primary differentiator is the **decoupling of the data-plane (Frontend) from the analytical-plane (NBE)**, using a sophisticated event-driven backbone to facilitate real-time anomaly detection, session correlation, and on-demand packet retrieval.
-
-### Core Architecture Principles
-
-* **Geo-Federation:** Instead of massive data duplication, we use **Elasticsearch Cross Cluster Search (CCS)** to query across regional pods.
-* **Intelligent Capture:** We achieve regulatory-grade packet capture using **Live Session Filtering**, ensuring expensive raw PCAP storage is only consumed for high-value anomalies.
-
----
-
-## 2. The Three-Tiered Topology
-
-### Tier 1: Frontend (FE) - The Acquisition Layer
-
-* **vTap & CP ECS:** Acting as the ingestion gateway, this tier performs load-balanced packet stripping.
-* **Processing Pipelines:** These pods decode complex telecom protocols (GTP, NGAP, Diameter) and produce high-fidelity metadata.
-* **Live Session Filter (Type 2):** This performs the "heavy lifting" of traffic inspection. By pinning these to specific hardware resources (or utilizing high-performance DPDK-like paths where possible), we minimize packet drops at the edge.
-
-### Tier 2: Routing/Backend Environment (RBE) - The Nervous System
-
-* **Kafka Backbone:** Partitioning is the key to our scalability. By keying topics with `murmur2(IMSI-hash)`, we guarantee that every event for a subscriber lands on the same partition.
-* **MirrorMaker 2:** This facilitates the asynchronous cross-DC replication essential for our active-active HA model.
-* **Storage Tiers:**
-* **Hot/Warm:** ClickHouse (OLAP) for CDR-like analytics and KPI rollups.
-* **Search:** Elasticsearch (distributed clusters) for signaling logs.
-* **Cold:** S3-compatible object store for long-term PCAP archive.
-
-### Tier 3: National Backend Environment (NBE) - The Analytics Intelligence
-
-* **ES Cross Cluster Search:** The "Smart Indexer" allows the APIs to aggregate data from local and GR-site Elasticsearch clusters without the overhead of bulk data replication.
-* **Dynamic Config:** The brain of the platform. It translates user-requested troubleshooting sessions into filter rules, which are propagated down to the FE/RBE in real-time via the Message Bus.
-
----
-
-## 3. High-Value Engineering Details (Beyond the Diagram)
-
-While the diagram shows the flow, the following architectural choices are critical for production stability:
-
-### 3.1 Streaming Semantics (Apache Flink)
-
-We utilize Flink with **checkpointing to S3** every 30 seconds. By employing a `bounded-out-of-orderness` watermark strategy, we handle the inherent latency jitters of telecom signaling. This is essential for maintaining accurate **session-setup-time KPIs** when packets arrive out of order from different taps.
-
-### 3.2 Tiered Storage & Cost Optimization
-
-We do not store all data on expensive NVMe. Our ClickHouse and Elasticsearch clusters utilize **TTL-based data movement**.
-
-* **Hot (0-7 days):** Local NVMe for instantaneous troubleshooting.
-* **Warm (7-30 days):** SATA SSDs for trend analysis.
-* **Cold (30-365 days):** S3-backed MergeTree tables.
-This allows us to maintain 13 months of data with a storage cost structure that is 80% lower than a monolithic approach.
-
-### 3.3 Resilient Deployment (GitOps)
-
-We utilize **ArgoCD with an App-of-Apps pattern**. Each pod (FE, RBE, NBE) is managed as a standalone helm release.
-
-* **Canary Analysis:** Argo Rollouts performs automated canary analysis based on Prometheus metrics. If the "error-budget" for a canary version burns too fast, the traffic is automatically shifted back to the stable version without manual intervention.
-
----
-
-## 4. Disaster Recovery (DR) Strategy
-
-Our DR strategy is **Active-Active** by design:
-
-* **Capture Layer:** Since raw packets are ephemeral, regional probes capture locally and persist to regional storage.
-* **Event Layer:** Metadata topics are replicated via Kafka MirrorMaker to the GR site, meaning that even if the primary site disappears, the historical event metadata is queryable from the GR site via the federated Elasticsearch cluster.
-
----
-
-### Summary for the Technical Interview
-
-This architecture is built for **telecom-grade reliability**. The combination of **distributed stream processing (Flink)**, **cross-cluster data federation (Elasticsearch CCS)**, and **dynamic rule propagation** allows us to provide massive visibility without the typical overhead of monolithic packet-capture platforms. I approach this architecture with an SRE mindset: assuming failure is imminent, designing for automatic recovery, and strictly enforcing SLOs at every pipeline stage.
-
-**Would you like me to expand on the specific Flink state-management techniques used for the session-stitching, or perhaps dive deeper into the ClickHouse sharding strategy?**
 
